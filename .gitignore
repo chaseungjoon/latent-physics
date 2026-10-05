@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 
+runs/
+.venv/
+.pytest_cache/
