@@ -101,12 +101,16 @@ def hidden_states(model: GRUWorldModel, X: torch.Tensor, batch_size: int = 1024)
 
 
 def probe_targets(env: Env, data: dict) -> tuple[np.ndarray, list[str]]:
-    """(n, T, K) targets: hidden params in probe space (constant in t) + observable velocity v_t."""
+    """(n, T, K) targets: hidden params in probe space (constant in t), env-specific derived quantities
+    (e.g. identifiable ratios), and the observable velocity v_t as a sanity check."""
     z = env.to_probe(data["params"])
+    derived = env.derived_targets(z)
+    if derived:
+        z = np.concatenate([z, np.stack(list(derived.values()), -1)], -1)
     T = data["actions"].shape[1]
     v = data["states"][:, :T, env.state_names.index("v")]
     targets = np.concatenate([np.broadcast_to(z[:, None], (len(z), T, z.shape[1])), v[..., None]], -1)
-    return targets, [p.name for p in env.params] + ["v (observable)"]
+    return targets, [p.name for p in env.params] + list(derived) + ["v (observable)"]
 
 
 def probe_emergence(layers: dict[str, np.ndarray], targets: np.ndarray, timesteps: list[int],
@@ -179,92 +183,244 @@ def _corr(a: np.ndarray, b: np.ndarray) -> float:
     return float((a @ b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 
-@torch.no_grad()
-def intervention_test(model: GRUWorldModel, env: Env, norm: Normalizer, data: dict, hid: dict[str, np.ndarray],
-                      probes: dict[str, RidgeProbe], z_std: np.ndarray, test_idx: np.ndarray, t_lo: int, rng,
-                      device, scale: float = 0.5, samples_per_traj: int = 4, n_random: int = 5) -> dict:
-    """Shift a GRU layer's state along a param's probe direction so the probe reading moves by
-    +-scale*std, and compare the change in the predicted next-state with the simulator's change when
-    that param is actually moved by the same amount (same s_t, a_t, other params fixed).
+def param_directions(hid: dict[str, np.ndarray], z: np.ndarray, X: np.ndarray, probes: dict[str, RidgeProbe],
+                     layers: list[str], train_idx, t_lo: int) -> dict[str, dict[str, np.ndarray]]:
+    """Two candidate unit directions per (layer, param), each (P, D):
 
-    corr  -- Pearson correlation between predicted and true effects (1 = physically faithful)
-    slope -- regression of predicted on true effect (1 = right magnitude)
-    rand_corr -- same with random directions of equal norm (control)
+    decode -- the linear probe's readout weights: the direction the *probe* reads the param from.
+    encode -- regression of the hidden state on all params *and the two most recent inputs*: the direction
+              the state actually moves when the param changes, with the current state held fixed. (Without
+              the state control, e.g. "heavy" would also pick up "moving slowly".)
+    The two differ whenever hidden dims are correlated; which one the model uses is an empirical question.
     """
+    T, n = X.shape[1], len(train_idx)
+    ctx = np.concatenate([X[train_idx, t_lo:], X[train_idx, t_lo - 1:T - 1]], -1).reshape(n * (T - t_lo), -1)
+    out = {"decode": {}, "encode": {}}
+    for name in layers:
+        H, Z, _ = pooled(hid[name], z, train_idx, t_lo)
+        dec = np.stack([probes[name].direction(k) for k in range(z.shape[1])])
+        R = np.concatenate([Z, ctx], -1)
+        enc = np.linalg.lstsq(R - R.mean(0), H - H.mean(0), rcond=None)[0][: z.shape[1]]
+        out["decode"][name] = dec / np.linalg.norm(dec, axis=1, keepdims=True)
+        out["encode"][name] = enc / np.linalg.norm(enc, axis=1, keepdims=True)
+    return out
+
+
+def natural_random_directions(hid: dict[str, np.ndarray], layers: list[str], train_idx, t_lo: int, n: int, rng):
+    """Random unit directions distributed like the hidden states themselves (N(0, Cov) draws), so the
+    control moves the state by a typical natural amount rather than along near-empty dimensions."""
+    out = []
+    for _ in range(n):
+        us = []
+        for name in layers:
+            H = hid[name][train_idx, t_lo:].reshape(-1, hid[name].shape[-1])
+            rows = H[rng.integers(len(H), size=512)] - H.mean(0)
+            u = rows.T @ rng.normal(size=len(rows))
+            us.append(u / np.linalg.norm(u))
+        out.append(us)
+    return out
+
+
+@torch.no_grad()
+def interchange_test(model: GRUWorldModel, env: Env, norm: Normalizer, data: dict, hid: dict[str, np.ndarray],
+                     dirs: dict, rand_dirs: list, test_idx: np.ndarray, t_lo: int, rng, device,
+                     samples_per_traj: int = 4, match_steps: int = 2, horizon: int = 10) -> dict:
+    """Swap ("interchange") test of causal use, on real hidden states only.
+
+    For trajectory A at time t, take the recurrent state of a different trajectory B whose recent history
+    matches A's (nearest neighbour on the last `match_steps` inputs, any late t') and copy over only its
+    component along a param's direction (in every GRU layer), then predict A's next step. Matching makes
+    the two memories differ mainly in what they believe about the hidden params, not in recent motion.
+
+    After the swap the model keeps reading A's real observations for `horizon` steps. At every step k the
+    change in its prediction is compared with the simulator's change when A's param is replaced by B's
+    (same states and actions of A). A filtering model may first react to the swap as a "surprise" (k=0)
+    and only express the swapped belief over the next steps, until A's evidence overwrites it.
+
+    full        -- swap the whole memory: does the model use its memory as its physics belief at all?
+    corr        -- correlation of predicted vs. true effect pooled over the horizon (1 = like physics)
+    corr_by_k   -- the same per step after the swap; corr_k0 = immediate step only
+    slope       -- 1 = the model fully adopts B's value along that direction
+    corr_other  -- strongest |corr| with the effect of swapping a *different* param (entanglement)
+    """
+    layers = model.gru_names
     states, actions, params = data["states"], data["actions"], data["params"]
     T = actions.shape[1]
-    traj = np.repeat(test_idx, samples_per_traj)
-    ts = rng.integers(max(t_lo, 1), T, size=len(traj))
-    X = norm.inputs(states[traj], actions[traj])[np.arange(len(traj)), ts]
-    x_t = torch.as_tensor(X, device=device)
-    names = model.gru_names
-    carry = [torch.as_tensor(hid[n][traj, ts - 1], device=device) for n in names]
-    base, _ = model.step(x_t, carry)
+    Xall = norm.inputs(states[test_idx], actions[test_idx])  # (n_test, T, D), rows aligned with test_idx
+    lo = max(t_lo, match_steps)
+    ia = np.repeat(np.arange(len(test_idx)), samples_per_traj)
+    ts = rng.integers(lo, T - horizon + 1, size=len(ia))
 
-    s_t, a_t, p = states[traj, ts], actions[traj, ts], params[traj]
-    s_next = env.step(s_t, a_t, p)
-    z = env.to_probe(p)
+    def history(i, t):  # the inputs the memory at t-1 has most recently consumed
+        return np.concatenate([Xall[i, t - j] for j in range(1, match_steps + 1)], -1)
 
-    def shifted(li, dh):
-        c = list(carry)
-        c[li] = c[li] + torch.as_tensor(dh, dtype=torch.float32, device=device)
-        return (model.step(x_t, c)[0] - base).cpu().numpy()
+    ci, ct = np.meshgrid(np.arange(len(test_idx)), np.arange(lo, T), indexing="ij")
+    ci, ct = ci.ravel(), ct.ravel()
+    cand = torch.as_tensor(history(ci, ct), device=device)
+    query = torch.as_tensor(history(ia, ts), device=device)
+    ib, tb = np.empty_like(ia), np.empty_like(ts)
+    for s0 in range(0, len(ia), 256):
+        d = torch.cdist(query[s0:s0 + 256], cand)
+        d[torch.as_tensor(ia[s0:s0 + 256], device=device)[:, None] == torch.as_tensor(ci, device=device)[None]] = float("inf")
+        j = d.argmin(1).cpu().numpy()
+        ib[s0:s0 + 256], tb[s0:s0 + 256] = ci[j], ct[j]
+    A_, B_ = test_idx[ia], test_idx[ib]
+    xs = [torch.as_tensor(Xall[ia, ts + k], device=device) for k in range(horizon)]
+    cA = [torch.as_tensor(hid[n][A_, ts - 1], device=device) for n in layers]
+    cB = [torch.as_tensor(hid[n][B_, tb - 1], device=device) for n in layers]
 
-    out = {}
-    for li, name in enumerate(names):
-        H = hid[name][test_idx, t_lo:].reshape(-1, hid[name].shape[-1])
-        spread = np.sqrt(H.var(0).sum())
-        for k, prm in enumerate(env.params):
-            w = probes[name].direction(k)
-            pred, true, rand = [], [], []
-            for sign in (1.0, -1.0):
-                delta = sign * scale * z_std[k]
-                dh = delta * w / (w @ w)
-                pred.append(shifted(li, dh))
-                rand.append(np.stack([shifted(li, r / np.linalg.norm(r) * np.linalg.norm(dh))
-                                      for r in rng.normal(size=(n_random, len(w)))]))
-                z2 = z.copy()
-                z2[:, k] += delta
-                p2 = np.maximum(env.from_probe(z2), 1e-6)
-                true.append((env.step(s_t, a_t, p2) - s_next) / norm.d_std)
-            pred, true, rand = np.stack(pred), np.stack(true), np.stack(rand, 1)  # rand: (n_random, 2, N, S)
-            out[f"{name}/{prm.name}"] = {
-                "layer": name, "param": prm.name,
-                "corr": _corr(pred, true),
-                "slope": float((pred * true).sum() / ((true ** 2).sum() + 1e-12)),
-                "rand_corr": float(np.mean([abs(_corr(r, true)) for r in rand])),
-                "shift_norm_over_spread": float(np.linalg.norm(dh) / spread),
-                # velocity-dimension samples for plotting
-                "_pred_v": pred[..., env.state_names.index("v")].ravel(),
-                "_true_v": true[..., env.state_names.index("v")].ravel(),
+    def run(carry):  # (horizon, N, S) predictions while reading A's real inputs
+        ys = []
+        for x in xs:
+            y, carry = model.step(x, carry)
+            ys.append(y)
+        return torch.stack(ys).cpu().numpy()
+
+    base = run(cA)
+    s_k = np.stack([states[A_, ts + k] for k in range(horizon)])
+    a_k = np.stack([actions[A_, ts + k] for k in range(horizon)])
+    flat = lambda x: x.reshape(-1, x.shape[-1])  # noqa: E731
+    pA = np.tile(params[A_], (horizon, 1))
+    s_next = env.step(flat(s_k), flat(a_k), pA)
+    zA, zB = env.to_probe(params[A_]), env.to_probe(params[B_])
+
+    def true_effect(ks):
+        z = zA.copy()
+        z[:, ks] = zB[:, ks]
+        eff = (env.step(flat(s_k), flat(a_k), np.tile(env.from_probe(z), (horizon, 1))) - s_next) / norm.d_std
+        return eff.reshape(base.shape)
+
+    def patched(us):
+        c = []
+        for li in range(len(layers)):
+            if us is None:
+                c.append(cB[li])
+            else:
+                u = torch.as_tensor(us[li], dtype=torch.float32, device=device)
+                c.append(cA[li] + ((cB[li] - cA[li]) @ u)[:, None] * u)
+        return run(c) - base
+
+    def stats(pred, true):
+        by_k = [_corr(pred[k], true[k]) for k in range(horizon)]
+        return {"corr": _corr(pred, true), "corr_k0": by_k[0], "corr_by_k": by_k,
+                "slope": float((pred * true).sum() / ((true ** 2).sum() + 1e-12))}
+
+    vi = env.state_names.index("v")
+    P = len(env.params)
+    true = [true_effect([k]) for k in range(P)]
+    pred_full, true_full = patched(None), true_effect(list(range(P)))
+    out = {"full": {**stats(pred_full, true_full), "_pred_v": pred_full[..., vi].ravel(), "_true_v": true_full[..., vi].ravel()}}
+    rand_preds = [patched(us) for us in rand_dirs]
+    for k, prm in enumerate(env.params):
+        rand = [stats(rp, true[k]) for rp in rand_preds]
+        for kind, d in dirs.items():
+            pred = patched([d[n][k] for n in layers])
+            out[f"{kind}/{prm.name}"] = {
+                **stats(pred, true[k]), "kind": kind, "param": prm.name,
+                "rand_corr": float(np.mean([abs(r["corr"]) for r in rand])),
+                "rand_corr_by_k": np.mean([np.abs(r["corr_by_k"]) for r in rand], 0).tolist(),
+                "corr_other": max([abs(_corr(pred, true[j])) for j in range(P) if j != k], default=0.0),
+                "_pred_v": pred[..., vi].ravel(), "_true_v": true[k][..., vi].ravel(),
             }
     return out
 
 
 @torch.no_grad()
-def ablation_test(model: GRUWorldModel, env: Env, X: torch.Tensor, Y: torch.Tensor, hid: dict[str, np.ndarray],
-                  probes: dict[str, RidgeProbe], train_idx, test_idx, t_lo: int, rng, device, n_random: int = 3) -> dict:
-    """Mean-ablate a param's 1-D probe direction in one GRU layer at every timestep and measure the
-    relative increase in late-timestep one-step loss, versus ablating random directions."""
+def ablation_test(model: GRUWorldModel, env: Env, data: dict, X: torch.Tensor, Y: torch.Tensor, hid: dict[str, np.ndarray],
+                  dirs: dict, rand_dirs: list, train_idx, test_idx, t_lo: int, device) -> dict:
+    """Mean-ablate one direction per GRU layer at every timestep and measure the damage.
+
+    rel_increase -- relative increase of late one-step loss
+    var_frac     -- fraction of the hidden variance that lives along the ablated directions; damage
+                    should be compared between directions of similar var_frac
+    sens_corr    -- correlation, over (trajectory, t), between the extra error and how much that param
+                    physically matters at that step (|change of next state| if the param moved by 1 std).
+                    High = the damage lands exactly where this param matters: a specific, not generic, role.
+    """
+    layers = model.gru_names
     Xt, Yt = X[test_idx], Y[test_idx]
+    Hs = [hid[n][train_idx, t_lo:].reshape(-1, hid[n].shape[-1]) for n in layers]
+    mus = [torch.as_tensor(H.mean(0), dtype=torch.float32, device=device) for H in Hs]
+    covs = [np.cov(H, rowvar=False) for H in Hs]
 
-    def late_loss(edit=None):
-        return ((model.forward_stepwise(Xt, edit) - Yt) ** 2)[:, t_lo:].mean().item()
+    def run(us):
+        edit = None
+        if us is not None:
+            ut = [torch.as_tensor(u, dtype=torch.float32, device=device) for u in us]
+            edit = lambda i, h: h - ((h - mus[i]) @ ut[i])[:, None] * ut[i]  # noqa: E731
+        return ((model.forward_stepwise(Xt, edit) - Yt) ** 2).mean(-1)[:, t_lo:].cpu().numpy()
 
-    def ablate(li, u_np, mu_np):
-        u = torch.as_tensor(u_np, dtype=torch.float32, device=device)
-        mu = torch.as_tensor(mu_np, dtype=torch.float32, device=device)
-        return lambda i, h: h - ((h - mu) @ u)[:, None] * u if i == li else h
+    def var_frac(us):
+        return float(np.mean([u @ C @ u / np.trace(C) for u, C in zip(us, covs)]))
 
-    base = late_loss()
-    out = {"base_loss": base}
-    for li, name in enumerate(model.gru_names):
-        mu = hid[name][train_idx].reshape(-1, hid[name].shape[-1]).mean(0)
-        rand = np.mean([late_loss(ablate(li, r / np.linalg.norm(r), mu))
-                        for r in rng.normal(size=(n_random, len(mu)))])
-        for k, prm in enumerate(env.params):
-            w = probes[name].direction(k)
-            loss = late_loss(ablate(li, w / np.linalg.norm(w), mu))
-            out[f"{name}/{prm.name}"] = {"rel_increase": (loss - base) / base,
-                                         "rand_rel_increase": (rand - base) / base}
+    z_std = env.to_probe(data["params"][train_idx]).std(0)
+    sens = param_sensitivity(env, data, test_idx, z_std, t_lo)
+
+    base = run(None)
+    out = {"base_loss": float(base.mean())}
+    rand_err = [run(us) for us in rand_dirs]
+    for k, prm in enumerate(env.params):
+        rand = {"rel_increase": float(np.mean([(e.mean() - base.mean()) / base.mean() for e in rand_err])),
+                "var_frac": float(np.mean([var_frac(us) for us in rand_dirs])),
+                "sens_corr": float(np.mean([_corr(e - base, sens[..., k]) for e in rand_err]))}
+        for kind, d in dirs.items():
+            us = [d[n][k] for n in layers]
+            err = run(us)
+            out[f"{kind}/{prm.name}"] = {"rel_increase": float((err.mean() - base.mean()) / base.mean()),
+                                         "var_frac": var_frac(us), "sens_corr": _corr(err - base, sens[..., k]),
+                                         "random": rand}
     return out
+
+
+def param_sensitivity(env: Env, data: dict, idx: np.ndarray, z_std: np.ndarray, t_lo: int) -> np.ndarray:
+    """How much each param physically matters at each step: squared change of the next state (in units of
+    the delta std) if the param moved by +1 std, for steps t >= t_lo. Returns (len(idx), T - t_lo, P)."""
+    states, actions, params = data["states"][idx], data["actions"][idx], data["params"][idx]
+    T = actions.shape[1]
+    n, Tl = len(idx), T - t_lo
+    s = states[:, t_lo:T].reshape(n * Tl, -1)
+    a = actions[:, t_lo:].reshape(n * Tl, -1)
+    z = np.repeat(env.to_probe(params), Tl, axis=0)
+    s_next = env.step(s, a, env.from_probe(z))
+    d_std = norm_d_std(data, env)
+    out = []
+    for k in range(len(env.params)):
+        z2 = z.copy()
+        z2[:, k] += z_std[k]
+        out.append((((env.step(s, a, env.from_probe(z2)) - s_next) / d_std) ** 2).sum(-1).reshape(n, Tl))
+    return np.stack(out, -1)
+
+
+def relevant_r2(layers: dict[str, np.ndarray], z: np.ndarray, sens: np.ndarray, train_idx, test_idx, t_lo: int, rng,
+                rel_frac: float = 0.1) -> tuple[dict[str, list], list[float]]:
+    """Linear-probe R^2 measured only at the steps where the param currently matters for the next step
+    (sensitivity > rel_frac * its mean), pooled over t >= t_lo. Answers "does the model know the param
+    when it needs it?"; the last-timestep R^2 instead penalizes forgetting a param that no longer matters
+    (e.g. friction after the block has stopped). `sens` is param_sensitivity over the whole split.
+
+    Returns ({layer: [R^2 or None per param]}, fraction of relevant steps per param). None = the param
+    (almost) never matters in this data, i.e. it is not identifiable from it."""
+    P = z.shape[1]
+    out = {name: [None] * P for name in layers}
+    frac = []
+    for k in range(P):
+        sk = sens[..., k]
+        rel = sk > rel_frac * sk.mean()
+        frac.append(float(rel.mean()))
+        if sk.mean() < 1e-10 or rel[train_idx].sum() < 50 or rel[test_idx].sum() < 50:
+            continue
+        for name, H in layers.items():
+            Hl = H[:, t_lo:]
+            tr, te = rel[train_idx], rel[test_idx]
+            Xtr, Xte = Hl[train_idx][tr], Hl[test_idx][te]
+            ytr = np.broadcast_to(z[train_idx, None, k], tr.shape)[tr][:, None]
+            yte = np.broadcast_to(z[test_idx, None, k], te.shape)[te][:, None]
+            groups = np.broadcast_to(train_idx[:, None], tr.shape)[tr]
+            probe = RidgeProbe().fit(Xtr, ytr, groups, rng)
+            out[name][k] = float(r2(yte, probe.predict(Xte))[0])
+    return out, frac
+
+
+def norm_d_std(data: dict, env: Env) -> np.ndarray:
+    """Scale for state changes: std of one-step deltas in this split."""
+    return np.diff(data["states"], axis=1).reshape(-1, len(env.state_names)).std(0) + 1e-6

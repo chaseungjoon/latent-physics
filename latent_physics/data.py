@@ -16,8 +16,7 @@ SPLIT_STREAM = {name: i for i, name in enumerate(SPLIT_KIND)}
 def generate_split(env: Env, split: str, n: int, T: int, force_prob: float, seed: int) -> dict:
     rng = np.random.default_rng([seed, SPLIT_STREAM[split]])
     params = env.sample_params(n, rng, SPLIT_KIND[split])
-    actions = env.sample_actions(n, T, rng, force_prob)
-    states = env.simulate(env.sample_init(n, rng), actions, params)
+    states, actions = env.simulate_episodes(env.sample_init(n, rng), params, T, rng, force_prob)
     return {"states": states, "actions": actions, "params": params}
 
 

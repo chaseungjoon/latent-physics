@@ -59,6 +59,19 @@ def test_splits_respect_holdouts():
         assert (ex >= prm.high).all() and (ex <= prm.extrap_high).all()
 
 
+def _episodes(env, n, T, force_prob, seed=0):
+    rng = np.random.default_rng(seed)
+    p = env.sample_params(n, rng, "id")
+    return env.simulate_episodes(env.sample_init(n, rng), p, T, rng, force_prob)
+
+
 def test_zero_force_prob_gives_no_actions():
-    env = ForcedMotion()
-    assert not env.sample_actions(10, 50, np.random.default_rng(0), force_prob=0.0).any()
+    _, actions = _episodes(ForcedMotion(), 50, 50, force_prob=0.0)
+    assert not actions.any()
+
+
+def test_velocity_distribution_stays_stationary():
+    states, _ = _episodes(ForcedMotion(), 2000, 100, force_prob=0.7)
+    v = np.abs(states[:, :, 1])
+    early, late = v[:, 20:40].ravel(), v[:, 80:].ravel()
+    assert np.quantile(late, 0.99) < 1.3 * np.quantile(early, 0.99)

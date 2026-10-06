@@ -43,6 +43,9 @@ def parse_args():
         ap.add_argument(f"--{k.replace('_', '-')}", type=int, default=None, help="override preset")
     ap.add_argument("--lr", type=float, default=None, help="override preset")
     ap.add_argument("--threads", type=int, default=None, help="torch CPU threads")
+    ap.add_argument("--reuse-models", action="store_true",
+                    help="load gru/mlp/oracle .pt from the output dir instead of training when they exist "
+                         "(re-runs only the analysis; data is regenerated identically from the seed)")
     return ap.parse_args()
 
 
@@ -58,7 +61,7 @@ def main():
         torch.set_num_threads(args.threads)
     out = Path(args.out or f"runs/{args.env}_{args.preset}_fp{args.force_prob:g}_s{args.seed}")
     out.mkdir(parents=True, exist_ok=True)
-    log_file = open(out / "log.txt", "w")
+    log_file = open(out / "log.txt", "a" if args.reuse_models else "w")
 
     def log(msg):
         print(msg, flush=True)
@@ -95,10 +98,20 @@ def main():
               "mlp": (MLPWorldModel(D, S).to(device), "X", cfg["mlp_epochs"]),
               "oracle": (MLPWorldModel(np_t["train"]["Xo"].shape[-1], S).to(device), "Xo", cfg["mlp_epochs"])}
     history = {}
+    old_history = {}
+    if args.reuse_models and (out / "metrics.json").exists():
+        old_history = json.loads((out / "metrics.json").read_text()).get("history", {})
     for name, (model, key, epochs) in models.items():
+        ckpt = out / f"{name}.pt"
+        if args.reuse_models and ckpt.exists():
+            model.load_state_dict(torch.load(ckpt, map_location=device))
+            model.eval()
+            history[name] = old_history.get(name, [])
+            log(f"[{name}] loaded {ckpt} (training skipped)")
+            continue
         history[name] = fit(model, T_["train"][key], T_["train"]["Y"], T_["val"][key], T_["val"]["Y"],
                             epochs=epochs, batch_size=cfg["batch_size"], lr=cfg["lr"], name=name, log=log)
-        torch.save(model.state_dict(), out / f"{name}.pt")
+        torch.save(model.state_dict(), ckpt)
 
     # ---- prediction & generalization ---------------------------------------------------------------
     T = cfg["T"]
@@ -135,8 +148,14 @@ def main():
     nonlinear = {layer: A.mlp_probe_r2(hid[layer][:, T - 1], z["id"], train_idx, test_idx, device).tolist()
                  for layer in gru.gru_names}
     log(f"MLP-probe R^2 at last t: {nonlinear}")
+    # R^2 only at the steps where each param physically matters for the next step
+    z_std = z["id"][train_idx].std(0)
+    sens = A.param_sensitivity(env, data["id"], np.arange(cfg["n_test"]), z_std, t_lo)
+    relevant, relevant_frac = A.relevant_r2(layers, z["id"], sens, train_idx, test_idx, t_lo, rng)
+    log(f"probe R^2 when relevant (relevant fraction {np.round(relevant_frac, 3).tolist()}): "
+        + ", ".join(f"{layer}={[None if x is None else round(x, 3) for x in r]}" for layer, r in relevant.items()))
 
-    # pooled late-t probes: used for OOD readout, interventions and ablations
+    # pooled late-t probes: used for OOD readout, swap tests and ablations
     probes = A.fit_pooled_probes(hid, z["id"], train_idx, t_lo, rng)
     probe_ood = {}
     for split in ("id", "comp", "extrap"):
@@ -147,13 +166,20 @@ def main():
             probe_ood.setdefault(layer, {})[split] = np.sqrt(((probe.predict(Xp) - Yp) ** 2).mean(0)).tolist()
 
     # ---- causal tests --------------------------------------------------------------------------------
-    z_std = z["id"][train_idx].std(0)
-    interventions = A.intervention_test(gru, env, norm, data["id"], hid, probes, z_std, test_idx, t_lo, rng, device)
-    ablations = A.ablation_test(gru, env, T_["id"]["X"], T_["id"]["Y"], hid, probes, train_idx, test_idx,
-                                t_lo, rng, device)
-    for key, r in interventions.items():
-        log(f"intervention {key}: corr {r['corr']:.3f} slope {r['slope']:.3f} rand {r['rand_corr']:.3f}  "
-            f"| ablation +{ablations[key]['rel_increase'] * 100:.1f}% (rand +{ablations[key]['rand_rel_increase'] * 100:.1f}%)")
+    dirs = A.param_directions(hid, z["id"], np_t["id"]["X"], probes, gru.gru_names, train_idx, t_lo)
+    rand_dirs = A.natural_random_directions(hid, gru.gru_names, train_idx, t_lo, 5, rng)
+    interchange = A.interchange_test(gru, env, norm, data["id"], hid, dirs, rand_dirs, test_idx, t_lo, rng, device)
+    ablations = A.ablation_test(gru, env, data["id"], T_["id"]["X"], T_["id"]["Y"], hid, dirs, rand_dirs[:3],
+                                train_idx, test_idx, t_lo, device)
+    log(f"swap whole memory: corr {interchange['full']['corr']:.3f} (k=0: {interchange['full']['corr_k0']:.3f}) "
+        f"slope {interchange['full']['slope']:.3f}")
+    for key, r in interchange.items():
+        if key != "full":
+            ab = ablations[key]
+            log(f"swap {key}: corr {r['corr']:.3f} (k=0: {r['corr_k0']:.3f}) slope {r['slope']:.3f} rand {r['rand_corr']:.3f} "
+                f"other {r['corr_other']:.3f} | ablation {ab['rel_increase'] * 100:+.1f}% "
+                f"(var {ab['var_frac']:.3f}, sens_corr {ab['sens_corr']:.3f}; random {ab['random']['rel_increase'] * 100:+.1f}%, "
+                f"var {ab['random']['var_frac']:.3f}, sens_corr {ab['random']['sens_corr']:.3f})")
 
     # ---- verdict & report -----------------------------------------------------------------------------
     results = {
@@ -164,20 +190,20 @@ def main():
         "probe": {"timesteps": timesteps, "targets": target_names,
                   "emergence": {k: v.tolist() for k, v in emergence.items()},
                   "shuffled_label_r2_top_last_t": shuffled.tolist(), "mlp_probe_r2_last_t": nonlinear,
-                  "pooled_rmse": probe_ood},
-        "interventions": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in interventions.items()},
+                  "relevant_r2": relevant, "relevant_frac": relevant_frac, "pooled_rmse": probe_ood},
+        "interchange": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in interchange.items()},
         "ablations": ablations,
         "runtime_s": time.time() - t_start,
     }
-    results["verdict"] = verdict(results, env, gru.gru_names)
-    write_report(out, results, interventions)
+    results["verdict"] = verdict(results, env)
+    write_report(out, results, interchange)
     with open(out / "metrics.json", "w") as f:
         json.dump(results, f, indent=2)
     log("\n" + "\n".join(f"[{c['status']}] {c['check']}: {c['detail']}" for c in results["verdict"]))
     log(f"\ndone in {results['runtime_s'] / 60:.1f} min -> {out}/report.md")
 
 
-def verdict(res: dict, env, gru_names: list[str]) -> list[dict]:
+def verdict(res: dict, env) -> list[dict]:
     """Heuristic viability checks. Thresholds are rules of thumb, not statistical tests."""
     checks = []
     late = res["prediction"]["late_mse"]
@@ -186,26 +212,38 @@ def verdict(res: dict, env, gru_names: list[str]) -> list[dict]:
     checks.append({"check": "Hidden physics matters & is inferred in-context",
                    "status": "PASS" if ratio < 0.5 else "FAIL",
                    "detail": f"GRU/memoryless-MLP late MSE = {ratio:.3f} (want < 0.5); GRU/oracle = {gap:.2f} (1 = matches privileged model)"})
-    em, names = res["probe"]["emergence"], res["probe"]["targets"]
+    full = res["interchange"]["full"]
+    checks.append({"check": "Memory is used as the physics belief (Level 4, exploratory: whole-memory swap)",
+                   "status": "PASS" if full["corr"] > 0.5 else "FAIL",
+                   "detail": f"swap memory with another trajectory: corr(pred, true effect)={full['corr']:.3f}, slope={full['slope']:.2f}"})
+    em, rel = res["probe"]["emergence"], res["probe"]["relevant_r2"]
     trained = [k for k in em if k != "input" and not k.startswith("untrained/")]
     untrained = [k for k in em if k.startswith("untrained/")] + ["input"]
     for k, prm in enumerate(env.params):
-        best = max(trained, key=lambda l: em[l][-1][k])
-        r_best = em[best][-1][k]
-        r_ctrl = max(em[l][-1][k] for l in untrained)
-        r_first = em[best][0][k]
-        checks.append({"check": f"{prm.name}: linearly decodable (Level 2)",
-                       "status": "PASS" if r_best > 0.5 and r_best - r_ctrl > 0.2 else "FAIL",
-                       "detail": f"best layer {best} R2={r_best:.3f} vs best control R2={r_ctrl:.3f}"})
+        if rel[trained[0]][k] is None:
+            checks.append({"check": f"{prm.name}: linearly decodable when it matters (Level 2)", "status": "N/A",
+                           "detail": f"{prm.name} (almost) never affects the next step in this data: not identifiable"})
+        else:
+            best = max(trained, key=lambda l: rel[l][k])
+            r_best, r_ctrl = rel[best][k], max(rel[l][k] for l in untrained)
+            checks.append({"check": f"{prm.name}: linearly decodable when it matters (Level 2)",
+                           "status": "PASS" if r_best > 0.5 and r_best - r_ctrl > 0.2 else "FAIL",
+                           "detail": f"best layer {best} R2={r_best:.3f} vs best control R2={r_ctrl:.3f} "
+                                     f"(on the {res['probe']['relevant_frac'][k] * 100:.0f}% of steps where it matters)"})
+        best = max(trained, key=lambda l: max(row[k] for row in em[l]))
+        peak = max(range(len(em[best])), key=lambda i: em[best][i][k])
+        r_peak, r_first = em[best][peak][k], em[best][0][k]
         checks.append({"check": f"{prm.name}: emerges as evidence accumulates",
-                       "status": "PASS" if r_best - r_first > 0.2 else "FAIL",
-                       "detail": f"{best} R2 t=0: {r_first:.3f} -> t=T-1: {r_best:.3f}"})
-        iv = [res["interventions"][f"{l}/{prm.name}"] for l in gru_names]
-        b = max(iv, key=lambda r: r["corr"])
-        checks.append({"check": f"{prm.name}: probe direction is causally used (Level 4)",
+                       "status": "PASS" if r_peak - r_first > 0.2 else "FAIL",
+                       "detail": f"{best} R2 t=0: {r_first:.3f} -> peak {r_peak:.3f} at t={res['probe']['timesteps'][peak]} "
+                                 f"(last t: {em[best][-1][k]:.3f})"})
+        ic = res["interchange"]
+        dec, enc = ic[f"decode/{prm.name}"], ic[f"encode/{prm.name}"]
+        b = max(dec, enc, key=lambda r: r["corr"])
+        checks.append({"check": f"{prm.name}: its direction is causally used (Level 4, exploratory: swap test)",
                        "status": "PASS" if b["corr"] > 0.3 and b["corr"] > b["rand_corr"] + 0.2 else "FAIL",
-                       "detail": f"{b['layer']}: corr(pred, true effect)={b['corr']:.3f}, slope={b['slope']:.3f}, "
-                                 f"random-direction |corr|={b['rand_corr']:.3f}"})
+                       "detail": f"corr over {len(dec['corr_by_k'])} steps after swap: decode={dec['corr']:.3f} / encode={enc['corr']:.3f} "
+                                 f"(slope {dec['slope']:.2f} / {enc['slope']:.2f}); random natural direction |corr|={b['rand_corr']:.3f}"})
     return checks
 
 

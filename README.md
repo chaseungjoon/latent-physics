@@ -56,4 +56,8 @@ prediction
     -> identifiability
 ```
 
-See [`PROPOSAL.md`](./PROPOSAL.md) for the full research proposal.
+## Documents
+
+- [`PROPOSAL.md`](./PROPOSAL.md): the full research proposal
+- [`QUICKSTART.md`](./QUICKSTART.md): setup, running the baseline, and the code map
+- [`PROGRESS.md`](./PROGRESS.md): what has been done so far, the results, and next steps

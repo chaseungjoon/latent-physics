@@ -39,6 +39,11 @@ class Env:
     comp_threshold: float = 0.7  # corner = both params above this quantile of their (probe-space) range
     extrap_param: int = 0
     input_dims: tuple[int, ...] | None = None  # state dims fed to the model (None = all); all dims are predicted
+    v_soft_max: float | None = None  # above this speed pushes become brakes (see simulate_episodes)
+
+    def derived_targets(self, z: np.ndarray) -> dict[str, np.ndarray]:
+        """Extra probe-only targets (functions of probe-space params), e.g. identifiable ratios."""
+        return {}
 
     # ---- parameters -------------------------------------------------------------------------
     def to_probe(self, p: np.ndarray) -> np.ndarray:
@@ -82,18 +87,36 @@ class Env:
         return self.from_probe(z)
 
     # ---- actions / initial states -------------------------------------------------------------
-    def sample_actions(self, n: int, T: int, rng: np.random.Generator, force_prob: float) -> np.ndarray:
-        """Piecewise-constant forces. Each segment is pushed with probability `force_prob`, else zero.
-        force_prob is the identifiability knob: with 0, mass never affects the trajectory."""
-        a = np.zeros((n, T, 1))
-        for k in range(n):
-            t = 0
-            while t < T:
-                L = rng.integers(self.seg_len[0], self.seg_len[1] + 1)
-                if rng.random() < force_prob:
-                    a[k, t:t + L, 0] = rng.uniform(-self.f_max, self.f_max)
-                t += L
-        return a
+    def simulate_episodes(self, s0: np.ndarray, p: np.ndarray, T: int, rng: np.random.Generator,
+                          force_prob: float) -> tuple[np.ndarray, np.ndarray]:
+        """Simulate with piecewise-constant forces chosen as the episode unfolds.
+
+        Each segment is pushed with probability `force_prob` (else zero force) with a uniform random
+        force. force_prob is the identifiability knob: with 0, mass never affects a `forced` trajectory.
+        If `v_soft_max` is set and the body is already faster than it, a push is turned into a brake
+        (same magnitude, opposite to v), which keeps the velocity distribution stationary over time
+        instead of letting a few trajectories run away. Returns states (n, T+1, S), actions (n, T, 1).
+        """
+        n = len(s0)
+        vi = self.state_names.index("v")
+        states = np.empty((n, T + 1, s0.shape[1]))
+        actions = np.zeros((n, T, 1))
+        states[:, 0] = s0
+        seg_left, force = np.zeros(n, dtype=int), np.zeros(n)
+        for t in range(T):
+            new = seg_left == 0
+            if new.any():
+                k = int(new.sum())
+                seg_left[new] = rng.integers(self.seg_len[0], self.seg_len[1] + 1, size=k)
+                f = rng.uniform(-self.f_max, self.f_max, size=k)
+                if self.v_soft_max is not None:
+                    v = states[new, t, vi]
+                    f = np.where(np.abs(v) > self.v_soft_max, -np.sign(v) * np.abs(f), f)
+                force[new] = np.where(rng.random(k) < force_prob, f, 0.0)
+            actions[:, t, 0] = force
+            seg_left -= 1
+            states[:, t + 1] = self.step(states[:, t], actions[:, t], p)
+        return states, actions
 
     def sample_init(self, n: int, rng: np.random.Generator) -> np.ndarray:
         raise NotImplementedError
@@ -132,6 +155,7 @@ class ForcedMotion(Env):
     # x is irrelevant to the dynamics and random-walks far outside its early range, so feeding it only
     # adds a drifting nuisance input; the model sees v (and F) and still predicts both dx and dv.
     input_dims = (1,)
+    v_soft_max = 15.0
 
     def sample_init(self, n, rng):
         return np.stack([rng.uniform(-1, 1, n), rng.uniform(-5, 5, n)], -1)
@@ -170,6 +194,10 @@ class SpringDamper(Env):
     substeps = 20
     f_max = 5.0
     extrap_param = 1
+
+    def derived_targets(self, z):
+        # without forcing only these ratios are identifiable (m alone is not)
+        return {"k/m": z[:, 1] - z[:, 0], "c/m": z[:, 2] - z[:, 0]}
 
     def sample_init(self, n, rng):
         return np.stack([rng.uniform(-1, 1, n), rng.uniform(-1, 1, n)], -1)
