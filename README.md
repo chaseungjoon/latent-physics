@@ -1,63 +1,21 @@
 # latent-physics
 
-Investigating whether state-based neural world models spontaneously learn meaningful physical structure.
+Does a neural world model trained only to predict the next state learn the hidden physics behind it?
 
-The project studies whether hidden physical properties such as mass, friction, restitution, stiffness, and damping emerge inside predictive dynamics models trained only to predict future states.
+Each trajectory follows `(state, action, hidden φ) -> next state`, where φ is mass, friction, stiffness, damping or restitution. The model only sees `(state, action) -> next state` and never gets φ. After training, we probe, intervene on and ablate its memory, and test how it generalizes.
 
-## Research Questions
+The systems are state-based (no video), so dynamics can be studied without perception: forced motion with friction, a mass-spring-damper, and later collisions.
 
-- Which physical quantities become decodable from hidden representations?
-- Where in the model do those representations emerge?
-- Are physical factors represented independently or in distributed subspaces?
-- Are decodable physical features actually used causally for prediction?
-- Do physically meaningful representations improve compositional and out-of-distribution generalization?
-- How does physical identifiability depend on the type and amount of observed interaction?
-
-## Core Idea
-
-A system evolves according to hidden physical parameters:
+Physical understanding is treated as a ladder, each rung harder than the last:
 
 ```text
-(state, action, hidden physics) -> next state
+prediction -> decodability -> structure -> causal use -> generalization -> identifiability
 ```
 
-The world model only observes:
-
-```text
-(state, action) -> next state
-```
-
-The hidden physical parameters are never provided during training. After training, the model's internal representations are analyzed through probing, intervention, ablation, and generalization experiments.
-
-## Scope
-
-Initial work focuses on controlled state-based dynamical systems rather than video, allowing physical reasoning to be studied independently from perception.
-
-Primary systems include:
-
-- forced motion with mass and friction
-- mass-spring-damper dynamics
-- collision dynamics with hidden mass and restitution
-
-## Goal
-
-The central question is:
-
-> Does accurate prediction imply that a world model has learned physical structure?
-
-This project treats physical understanding as a hierarchy:
-
-```text
-prediction
-    -> decodability
-    -> representation structure
-    -> causal use
-    -> generalization
-    -> identifiability
-```
+Questions: which parameters become decodable and where; whether they are stored separately or spread out; whether the model actually uses them; whether that helps out of distribution; and how all of this depends on how informative the data are.
 
 ## Documents
 
-- [`PROPOSAL.md`](./PROPOSAL.md): the full research proposal
-- [`QUICKSTART.md`](./QUICKSTART.md): setup, running the baseline, and the code map
-- [`PROGRESS.md`](./PROGRESS.md): what has been done so far, the results, and next steps
+- [`PROPOSAL.md`](./PROPOSAL.md): the research proposal
+- [`QUICKSTART.md`](./QUICKSTART.md): setup, commands, code map
+- [`PROGRESS.md`](./PROGRESS.md): results so far and next steps
