@@ -1,7 +1,7 @@
 """Collate many runs into one table (mean ± std over seeds per env × force_prob).
 
-    uv run python -m latent_physics.summarize            # all runs under runs/
-    uv run python -m latent_physics.summarize runs/foo*  # a subset
+    uv run python -m latent_physics.experiments.summarize            # all runs under runs/
+    uv run python -m latent_physics.experiments.summarize runs/foo*  # a subset
 """
 from __future__ import annotations
 

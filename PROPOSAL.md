@@ -229,7 +229,7 @@ Examples include:
 
 These are not generally observable from a single instantaneous state. They must be inferred from how the system responds over time or under interventions.
 
-The distinction is important. If velocity becomes decodable very early while mass emerges only after temporal evidence accumulates, this would indicate that representation formation reflects the information requirements of the underlying physical quantities.
+If velocity becomes decodable very early while mass emerges only after temporal evidence accumulates, this would indicate that representation formation reflects the information requirements of the underlying physical quantities.
 
 ### Main question
 
@@ -665,7 +665,7 @@ Such a result would demonstrate that ordinary predictive accuracy is insufficien
 
 # 13. Relevant Prior Work
 
-The proposed study sits at the intersection of several recent research directions. The most directly relevant works are summarized below in approximate order of conceptual proximity.
+The most directly relevant works are summarized below in approximate order of conceptual proximity.
 
 ## 13.1 Joseph et al. (2026), *Interpreting Physics in Video World Models*
 
@@ -678,7 +678,7 @@ This work motivates several elements of the present proposal:
 - skepticism toward the assumption that models reproduce classical factorized state variables,
 - and the distinction between representation accessibility and representation organization.
 
-The proposed project differs in a crucial way: it removes the visual perception problem and studies **state-based predictive dynamics with exact hidden physical ground truth**. This enables controlled variation of mass, friction, restitution, and related factors, as well as direct identifiability and intervention experiments that are difficult to isolate in video.
+The proposed project differs in that it removes the visual perception problem and studies **state-based predictive dynamics with exact hidden physical ground truth**. This enables controlled variation of mass, friction, restitution, and related factors, as well as direct identifiability and intervention experiments that are difficult to isolate in video.
 
 ## 13.2 Baumgartner et al. (2026), *Disentangling Dynamical Systems: Causal Representation Learning Meets Local Sparse Attention*
 
@@ -709,7 +709,7 @@ The proposed work departs from Yao et al. by making parameter identification an 
 
 ## 13.4 Alam (2026), *Causal Physics Steering in Video World Models via Concept Activation Vectors*
 
-Alam extends probing-based physics interpretability by intervening directly on representation directions associated with physical concepts. The study demonstrates that a representation can be not only readable but also steerable, providing evidence that intervention is a stronger test than decodability alone.
+Alam extends probing-based physics interpretability by intervening directly on representation directions associated with physical concepts. The study shows that such a representation can be steered as well as read, which is evidence that intervention is a stronger test than decodability alone.
 
 This directly motivates the proposed causal intervention framework.
 
